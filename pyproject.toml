@@ -1,0 +1,5 @@
+[project]
+name = "car-value-finder"
+version = "0.1.0"
+description = "Streamlit app to analyze Tesla Model 3 listings"
+requires-python = ">=3.9,<3.13"
