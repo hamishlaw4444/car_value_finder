@@ -1,5 +1,3 @@
-
-
 import re
 import numpy as np
 import pandas as pd
@@ -7,6 +5,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from typing import Optional, Dict, Any
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -145,89 +146,27 @@ def clean_autotrader_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ----------------------------
-# Modeling (NumPy-based)
+# Modeling (scikit-learn)
 # ----------------------------
 
-class SimpleLinearModel:
-    def __init__(self, intercept: float, coef: np.ndarray):
-        self.intercept_ = float(intercept)
-        self.coef_ = np.asarray(coef, dtype=float)
-
-    def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
-        X_arr = X.values if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=float)
-        return self.intercept_ + X_arr @ self.coef_
-
-
-def _train_test_split_idx(n: int, test_size: float = 0.2, seed: int = 42):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    split = int(n * (1 - test_size))
-    return idx[:split], idx[split:]
-
-
-def _fit_linear(X: np.ndarray, y: np.ndarray) -> SimpleLinearModel:
-    # Add bias term for intercept
-    X_design = np.column_stack([np.ones(len(X)), X])
-    # Solve least squares
-    beta, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
-    intercept = beta[0]
-    coef = beta[1:]
-    return SimpleLinearModel(intercept, coef)
-
-
-def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    return 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
-
-
-def _mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.mean(np.abs(y_true - y_pred)))
-
-
-def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-
-def _kfold_r2(model_features: np.ndarray, y: np.ndarray, k: int = 5, seed: int = 42) -> np.ndarray:
-    n = len(y)
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    folds = np.array_split(idx, k)
-    scores = []
-    for i in range(k):
-        test_idx = folds[i]
-        train_idx = np.concatenate([folds[j] for j in range(k) if j != i])
-        X_tr, y_tr = model_features[train_idx], y[train_idx]
-        X_te, y_te = model_features[test_idx], y[test_idx]
-        model = _fit_linear(X_tr, y_tr)
-        y_pred = model.predict(X_te)
-        scores.append(_r2_score(y_te, y_pred))
-    return np.asarray(scores, dtype=float)
-
-
 def fit_linear_regression(df: pd.DataFrame) -> Dict[str, Any]:
-    """Fit linear regression model with simple validation and k-fold CV (NumPy)."""
+    """Fit linear regression model with cross-validation (scikit-learn)."""
     if len(df) < 10:
         st.warning("⚠️ Not enough data for reliable model training (need at least 10 listings)")
         return {}
 
-    X = df[["mileage_clean", "age_clean"]].astype(float).values
-    y = df["price_clean"].astype(float).values
+    X = df[["mileage_clean", "age_clean"]].astype(float)
+    y = df["price_clean"].astype(float)
 
-    tr_idx, te_idx = _train_test_split_idx(len(df), test_size=0.2, seed=42)
-    X_tr, X_te = X[tr_idx], X[te_idx]
-    y_tr, y_te = y[tr_idx], y[te_idx]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
 
-    model = _fit_linear(X_tr, y_tr)
-    y_pred = model.predict(X_te)
-
-    r2 = _r2_score(y_te, y_pred)
-    mae = _mae(y_te, y_pred)
-    rmse = _rmse(y_te, y_pred)
-    cv_scores = _kfold_r2(X, y, k=5, seed=42)
+    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+    cv_scores = cross_val_score(model, X, y, cv=5, scoring='r2')
 
     coefs = {
         "intercept": float(model.intercept_),
@@ -235,7 +174,7 @@ def fit_linear_regression(df: pd.DataFrame) -> Dict[str, Any]:
         "age_coef": float(model.coef_[1])
     }
 
-    models = {
+    return {
         'linear': {
             'model': model,
             'r2': r2,
@@ -247,7 +186,6 @@ def fit_linear_regression(df: pd.DataFrame) -> Dict[str, Any]:
         'best_model': 'linear',
         'best_model_obj': model
     }
-    return models
 
 
 
@@ -340,7 +278,7 @@ def build_reasoning(row: pd.Series, ref_df: pd.DataFrame) -> str:
     return " ".join(parts)
 
 
-def estimate_depreciation(df: pd.DataFrame, model: SimpleLinearModel, miles_per_year: int, hold_years: int) -> pd.DataFrame:
+def estimate_depreciation(df: pd.DataFrame, model: LinearRegression, miles_per_year: int, hold_years: int) -> pd.DataFrame:
     df = df.copy()
     delta_miles = miles_per_year * hold_years
     X_now = df[["mileage_clean", "age_clean"]].astype(float).values
