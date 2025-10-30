@@ -13,9 +13,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from typing import Optional, Dict, Any
 import warnings
 warnings.filterwarnings('ignore')
@@ -142,57 +139,109 @@ def clean_autotrader_df(df: pd.DataFrame) -> pd.DataFrame:
     if "advert_id" not in df.columns or not df["advert_id"].notna().any():
         df["advert_id"] = df["url"].apply(_extract_advert_id_from_url)
     else:
-        # fill NaNs only
         missing_mask = df["advert_id"].isna()
         df.loc[missing_mask, "advert_id"] = df.loc[missing_mask, "url"].apply(_extract_advert_id_from_url)
 
     # Final cleaning
     df = df.dropna(subset=["price_clean", "mileage_clean", "year_clean", "age_clean"]).reset_index(drop=True)
-
-    # Filter out listings with unrealistic mileage (null or less than 5,000 miles)
     df = df[df["mileage_clean"] >= 5000].reset_index(drop=True)
 
-    # Deduplicate on advert_id if available
     if df["advert_id"].notna().any():
         df = df.drop_duplicates(subset=["advert_id"], keep="first")
 
     return df
 
 # ----------------------------
-# Modeling
+# Modeling (NumPy-based)
 # ----------------------------
 
+class SimpleLinearModel:
+    def __init__(self, intercept: float, coef: np.ndarray):
+        self.intercept_ = float(intercept)
+        self.coef_ = np.asarray(coef, dtype=float)
+
+    def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        X_arr = X.values if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=float)
+        return self.intercept_ + X_arr @ self.coef_
+
+
+def _train_test_split_idx(n: int, test_size: float = 0.2, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    split = int(n * (1 - test_size))
+    return idx[:split], idx[split:]
+
+
+def _fit_linear(X: np.ndarray, y: np.ndarray) -> SimpleLinearModel:
+    # Add bias term for intercept
+    X_design = np.column_stack([np.ones(len(X)), X])
+    # Solve least squares
+    beta, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+    intercept = beta[0]
+    coef = beta[1:]
+    return SimpleLinearModel(intercept, coef)
+
+
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
+
+
+def _mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def _kfold_r2(model_features: np.ndarray, y: np.ndarray, k: int = 5, seed: int = 42) -> np.ndarray:
+    n = len(y)
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    folds = np.array_split(idx, k)
+    scores = []
+    for i in range(k):
+        test_idx = folds[i]
+        train_idx = np.concatenate([folds[j] for j in range(k) if j != i])
+        X_tr, y_tr = model_features[train_idx], y[train_idx]
+        X_te, y_te = model_features[test_idx], y[test_idx]
+        model = _fit_linear(X_tr, y_tr)
+        y_pred = model.predict(X_te)
+        scores.append(_r2_score(y_te, y_pred))
+    return np.asarray(scores, dtype=float)
+
+
 def fit_linear_regression(df: pd.DataFrame) -> Dict[str, Any]:
-    """Fit linear regression model with cross-validation"""
+    """Fit linear regression model with simple validation and k-fold CV (NumPy)."""
     if len(df) < 10:
         st.warning("⚠️ Not enough data for reliable model training (need at least 10 listings)")
         return {}
-    
-    # Prepare features
-    X = df[["mileage_clean", "age_clean"]].astype(float)
-    y = df["price_clean"].astype(float)
-    
-    # Split data for validation
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # Fit linear regression
-    model = LinearRegression()
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    
-    # Calculate metrics
-    r2 = r2_score(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    cv_scores = cross_val_score(model, X, y, cv=5, scoring='r2')
-    
-    # Get coefficients
+
+    X = df[["mileage_clean", "age_clean"]].astype(float).values
+    y = df["price_clean"].astype(float).values
+
+    tr_idx, te_idx = _train_test_split_idx(len(df), test_size=0.2, seed=42)
+    X_tr, X_te = X[tr_idx], X[te_idx]
+    y_tr, y_te = y[tr_idx], y[te_idx]
+
+    model = _fit_linear(X_tr, y_tr)
+    y_pred = model.predict(X_te)
+
+    r2 = _r2_score(y_te, y_pred)
+    mae = _mae(y_te, y_pred)
+    rmse = _rmse(y_te, y_pred)
+    cv_scores = _kfold_r2(X, y, k=5, seed=42)
+
     coefs = {
         "intercept": float(model.intercept_),
         "mileage_coef": float(model.coef_[0]),
         "age_coef": float(model.coef_[1])
     }
-    
+
     models = {
         'linear': {
             'model': model,
@@ -201,12 +250,10 @@ def fit_linear_regression(df: pd.DataFrame) -> Dict[str, Any]:
             'rmse': rmse,
             'cv_scores': cv_scores,
             'coefs': coefs
-        }
+        },
+        'best_model': 'linear',
+        'best_model_obj': model
     }
-    
-    models['best_model'] = 'linear'
-    models['best_model_obj'] = model
-    
     return models
 
 
@@ -300,14 +347,14 @@ def build_reasoning(row: pd.Series, ref_df: pd.DataFrame) -> str:
     return " ".join(parts)
 
 
-def estimate_depreciation(df: pd.DataFrame, model: LinearRegression, miles_per_year: int, hold_years: int) -> pd.DataFrame:
+def estimate_depreciation(df: pd.DataFrame, model: SimpleLinearModel, miles_per_year: int, hold_years: int) -> pd.DataFrame:
     df = df.copy()
     delta_miles = miles_per_year * hold_years
-    X_now = df[["mileage_clean", "age_clean"]].astype(float)
-    X_future = pd.DataFrame({
-        "mileage_clean": df["mileage_clean"].astype(float) + float(delta_miles),
-        "age_clean": df["age_clean"].astype(float) + float(hold_years),  # Age increases over time
-    })
+    X_now = df[["mileage_clean", "age_clean"]].astype(float).values
+    X_future = np.column_stack([
+        df["mileage_clean"].astype(float).values + float(delta_miles),
+        df["age_clean"].astype(float).values + float(hold_years),  # Age increases over time
+    ])
 
     pred_now = model.predict(X_now)
     pred_future = model.predict(X_future)
@@ -1128,7 +1175,7 @@ pred_df = clean_df.copy()
 # Use linear regression model for predictions
 if models and 'linear' in models:
     model = models['linear']['model']
-    X = pred_df[["mileage_clean", "age_clean"]].astype(float)
+    X = pred_df[["mileage_clean", "age_clean"]].astype(float).values
     pred_df["predicted_price"] = model.predict(X)
     pred_df["value_gap"] = pred_df["predicted_price"] - pred_df["price_clean"]
     pred_df["value_pct"] = pred_df["value_gap"] / pred_df["predicted_price"]
@@ -1345,7 +1392,7 @@ if submitted and models and 'linear' in models:
     model = models['linear']['model']
     
     # Make prediction
-    X_input = input_car[["mileage_clean", "age_clean"]].astype(float)
+    X_input = input_car[["mileage_clean", "age_clean"]].astype(float).values
     predicted_price = model.predict(X_input)[0]
     value_gap = predicted_price - input_price
     value_pct = value_gap / predicted_price if predicted_price > 0 else 0
