@@ -1,11 +1,4 @@
-# requirements.txt (for Cursor)
-# streamlit
-# pandas
-# numpy
-# scikit-learn
-# plotly
-# statsmodels
-# plotly.graph_objects
+
 
 import re
 import numpy as np
